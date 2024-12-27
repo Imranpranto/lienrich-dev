@@ -1,5 +1,5 @@
-import React, { createContext, useContext, useEffect, useState } from 'react';
-import { User, Session } from '@supabase/supabase-js';
+import React, { createContext, useEffect, useState } from 'react';
+import { User } from '@supabase/supabase-js';
 import { supabase } from '../lib/supabase';
 import { initializeDatabase } from '../utils/database';
 import { toast } from '../utils/toast';
@@ -27,37 +27,108 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     loading: true,
     emailVerified: false
   });
-  const [error, setError] = useState<string | null>(null);
+  const [error] = useState<string | null>(null);
 
   useEffect(() => {
-    // Check active session
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setState(prev => ({ 
-        ...prev, 
-        user: session?.user ?? null, 
-        loading: false,
-        emailVerified: true // Remove email verification check
-      }));
-    });
+    let mounted = true;
+
+    async function initSession() {
+      try {
+        // Check active session
+        const { data: { session } } = await supabase.auth.getSession();
+        
+        if (!mounted) return;
+
+        if (session?.user) {
+          const emailVerified = session.user.email_confirmed_at != null;
+          
+          setState(prev => ({
+            ...prev,
+            user: session.user,
+            emailVerified,
+            loading: true // Keep loading true while we initialize
+          }));
+
+          const dbInitialized = await initializeDatabase();
+          if (!dbInitialized) {
+            console.error('Database initialization failed');
+            toast.error('Failed to initialize application data. Please try refreshing the page.');
+            // Sign out user if database initialization fails
+            await supabase.auth.signOut();
+            setState(prev => ({ 
+              ...prev, 
+              user: null,
+              loading: false 
+            }));
+            return;
+          }
+        }
+
+        if (mounted) {
+          setState(prev => ({ ...prev, loading: false }));
+        }
+      } catch (err) {
+        console.error('Session check error:', err);
+        if (mounted) {
+          setState(prev => ({ ...prev, loading: false }));
+          toast.error('Failed to check login status. Please refresh the page.');
+        }
+      }
+    }
+
+    // Initialize session
+    initSession();
 
     // Listen for auth changes
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
+      if (!mounted) return;
+
+      setState(prev => ({ ...prev, loading: true }));
+
       if (event === 'SIGNED_IN' && session?.user) {
-        await initializeDatabase(); // Initialize database when user signs in
+          const dbInitialized = await initializeDatabase();
+          if (!dbInitialized) {
+            console.error('Database initialization failed on sign in');
+            if (mounted) {
+              toast.error('Failed to initialize application data. Please try signing in again.');
+              // Sign out user if database initialization fails
+              await supabase.auth.signOut();
+              setState(prev => ({ 
+                ...prev, 
+                user: null,
+                loading: false 
+              }));
+            }
+            return;
+          }
+          
+          if (mounted) {
+            setState(prev => ({
+              ...prev,
+              user: session.user,
+              emailVerified: session.user.email_confirmed_at != null,
+              loading: false
+            }));
+          }
+      } else {
+        if (mounted) {
+          setState(prev => ({
+            ...prev,
+            user: session?.user ?? null,
+            emailVerified: session?.user?.email_confirmed_at != null,
+            loading: false
+          }));
+        }
       }
-      setState(prev => ({ 
-        ...prev, 
-        user: session?.user ?? null,
-        emailVerified: true // Remove email verification check
-      }));
     });
 
     return () => {
+      mounted = false;
       subscription.unsubscribe();
     };
   }, []);
 
-  const signIn = async (email: string, password: string) => {
+  const signIn = async (email: string, password: string): Promise<void> => {
     try {
       const { data, error } = await supabase.auth.signInWithPassword({ 
         email: email.trim(), 
@@ -65,23 +136,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       });
       
       if (error) {
-        return { error };
+        throw error;
       }
       
       if (!data.user) {
-        return { error: new Error('Login failed') };
+        throw new Error('Login failed');
       }
 
       setState(prev => ({
         ...prev,
         user: data.user,
-        emailVerified: true
+        emailVerified: data.user.email_confirmed_at != null
       }));
-      
-      return { data };
     } catch (error) {
       console.error('Sign in error:', error);
-      return { error };
+      throw error;
     }
   };
 

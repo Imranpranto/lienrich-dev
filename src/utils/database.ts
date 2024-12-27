@@ -1,71 +1,74 @@
 import { supabase } from '../lib/supabase';
 
 export async function initializeDatabase() {
-  try {
-    console.log('Initializing database...');
-    
-    // Add delay to ensure auth is ready
-    await new Promise(resolve => setTimeout(resolve, 1000));
+  const initPromise = Promise.race([
+    (async () => {
+      console.log('Initializing database...');
 
-    // Get current user
-    const { data: { session }, error: sessionError } = await supabase.auth.getSession();
-    if (sessionError) throw sessionError;
-    
-    const user = session?.user;
-    if (!user) {
-      console.log('No user found during database initialization');
-      return;
-    }
-
-    console.log('Checking profile for user:', user.id);
-
-    // Check if profile exists
-    const { data: profile, error } = await supabase
-      .from('profiles')
-      .select('id')
-      .eq('id', user.id)
-      .single();
-
-    if (error) {
-      console.log('Profile check error:', error);
-      if (error.code === 'PGRST116') {
-        console.log('Profile not found, creating new profile');
-      } else {
-      // Other errors should be thrown
-      throw error;
+      // Get current user
+      const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError) throw sessionError;
+      
+      const user = session?.user;
+      if (!user) {
+        console.log('No user found during database initialization');
+        return false;
       }
-    }
 
-    // If profile exists, database is already initialized
-    if (profile) return;
+      // First check if profile exists
+      const { error: profileError } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', user.id)
+        .single();
 
-    // Initialize profile
-    console.log('Creating new profile for user:', user.id);
+      if (profileError) {
+        console.error('Profile check failed:', profileError.message, 'Code:', profileError.code);
+        // If profile doesn't exist or permission error, try to create it
+        if (profileError.code === 'PGRST116' || profileError.code === 'PGRST301') {
+          const { error: insertError } = await supabase
+            .from('profiles')
+            .insert({
+              id: user.id,
+              email: user.email!,
+              plan: 'Trial',
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString()
+            });
 
-    const { error: insertError } = await supabase.from('profiles').insert({
-      id: user.id,
-      email: user.email!,
-      plan: 'Trial',
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
-    });
+          if (insertError) {
+            console.error('Profile creation failed:', insertError);
+            throw new Error(`Failed to create profile: ${insertError.message} (Code: ${insertError.code})`);
+          }
+        } else {
+          throw new Error(`Failed to check profile: ${profileError.message} (Code: ${profileError.code})`);
+        }
+      }
 
-    if (insertError) {
-      console.error('Failed to create profile:', insertError);
-      throw insertError;
-    }
+      // Verify we can read the profile (tests permissions)
+      const { data: verifyProfile, error: verifyError } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', user.id)
+        .single();
 
-    console.log('Database initialized successfully for user:', user.id);
-    return true;
+      if (verifyError || !verifyProfile) {
+        console.error('Profile verification failed:', verifyError);
+        throw new Error(`Failed to verify profile access: ${verifyError?.message || 'Unknown error'} (Code: ${verifyError?.code || 'none'})`);
+      }
 
+      console.log('Database initialized successfully for user:', user.id);
+      return true;
+    })(),
+    new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Database initialization timed out')), 10000)
+    )
+  ]);
+
+  try {
+    return await initPromise;
   } catch (error) {
-    console.error('Database initialization error:', error);
-    
-    // Only throw error if it's not a duplicate key violation
-    if (error instanceof Error && !error.message.includes('duplicate key')) {
-      throw error;
-    }
-    
-    throw error;
+    console.error('Database initialization failed:', error);
+    return false; // Return false instead of throwing to prevent loading state from getting stuck
   }
 }
